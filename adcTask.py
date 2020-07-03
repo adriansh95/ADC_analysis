@@ -3,6 +3,7 @@ import numpy as np
 import scipy.stats
 import matplotlib.pyplot as plt
 import os
+from pathlib import Path
 import glob
 import pickle as pkl
 
@@ -90,12 +91,14 @@ class adcDataset:
         self.__dict__['sensors'] = {}
 
         sensors_dict = {SNN: '' for SNN in SNNs}
-        profiles_dict = {SNN: {f'amp{hdu:02d}': {} for hdu in range(1,17)} for SNN in SNNs } 
+        profiles_dict = {SNN: {f'amp{hdu:02d}': {} for hdu in range(1,17)} for SNN in SNNs} 
 
         for raftname in get_raftnames_run(self.run):
-            self.sensors[raftname] = sensors_dict
-            self.profiles[raftname] = profiles_dict
+            self.sensors[raftname] = {SNN: '' for SNN in SNNs}
+            self.profiles[raftname] = {SNN: {f'amp{hdu:02d}': {} for hdu in range(1,17)} for SNN in SNNs} 
 
+        self.profiles['R30']['S22'][f'amp16']['1s_bit'] = 1## 
+ 
     def __setattr__(self, attribute, value):
         """Protect class attributes"""
         if attribute not in self.__dict__:
@@ -107,33 +110,30 @@ class adcDataset:
     def fill_dataset(self):
         run = self.run
         infile_subdict = {SNN: [] for SNN in SNNs} 
-        im_array_subdict = {SNN: {} for SNN in SNNs} 
-        im_arrays = {}
         prof_bin_size = self.bin_size
 
-        for raftname in self.sensors.keys():
-            im_arrays[raftname] = im_array_subdict
 
         sflat_files_dict = get_sflat_files_run(run)
-        for raft, SNN_dict in sflat_files_dict.items():
+        SNN = 'S00'
+        for raftname, SNN_dict in sflat_files_dict.items():
             for SNN, imagetype_dict in SNN_dict.items():
+                imagetype_dict = sflat_files_dict[raftname][SNN]
                 files_list = imagetype_dict['SFLAT']
 
                 try:
                     imfile = files_list[0]
-                    print(f'Working on {raft} {SNN}')
+                    print(f'Working on {raftname} {SNN}')
                 except IndexError:
-                    print(f'No files for {raft} {SNN} run {run}') 
-                    continue
+                    print(f'No files for {raftname} {SNN} run {run}') 
+                    continue 
 
                 im_md = afw_image.readMetadata(imfile, 0)
                 CCD_name = im_md.get('LSST_NUM')
-                self.sensors[raft][SNN] = CCD_name
+                self.sensors[raftname][SNN] = CCD_name
 
                 for hdu in range(1,17):
                     imarray = im_to_array(imfile, hdu)
                     imarray, low, high = scipy.stats.sigmaclip(imarray, low = 3.0, high = 3.0)
-                    im_arrays[raft][SNN][hdu] = imarray
 
                     prof_xmin = min(imarray)
                     prof_xmin = prof_xmin - prof_xmin % prof_bin_size
@@ -147,13 +147,12 @@ class adcDataset:
                         xval, yval, xerr, yerr = mkProfile(imarray, bit_on, nx=prof_nx, xmin=prof_xmin, xmax=prof_xmax) 
 
                         if len(xval) == 0:
-                            print((f' Len xval = 0 for {run} {raft} {SNN} amp{hdu:02d}, '
-                            'possible dead channel'))
+                            print(f'Len xval = 0 for {run} {raftname} {SNN} amp{hdu:02d}, '
+                            'possible dead channel')
                             break
-
                         else:
                             prof = profile(xval, yval, xerr, yerr)
-                            self.profiles[raft][SNN][f'amp{hdu:02d}'][f'{prof_bit}s_bit'] = prof
+                            self.profiles[raftname][SNN][f'amp{hdu:02d}'][f'{prof_bit}s_bit'] = prof 
 
     def save(self, write_to):
         run = self.run
@@ -162,10 +161,10 @@ class adcDataset:
             bit = 2**bit_power
             pkl_name += f'{bit}s_'
         pkl_name += 'dataset.pkl'
-        pkl_file_name = os.path.join(write_to, pkl_name)
+        pkl_file_name = os.path.join(write_to, 'datasets', pkl_name)
         with open(pkl_file_name, 'wb') as pkl_file:
             pkl.dump(self, pkl_file)
-        print(f'Wrote {pkl_name}')
+        print(f'Wrote {pkl_file_name}')
 
 class adcTask(): 
     """Task to make ADC profiles"""
@@ -215,6 +214,7 @@ class adcTask():
 
         for raftname in raftnames:
             for SNN in SNNs:
+                print(f'Making plots for {raftname} {SNN}')
                 profs, p_axs = plt.subplots(8, 2, sharey=True, sharex=False, figsize=(30, 20))
                 p_axs = p_axs.ravel()
                 title = f'{raftname} {SNN} '
@@ -231,8 +231,10 @@ class adcTask():
                         sensor = dataset.sensors[raftname][SNN]
                         #this guy below could be fixed. Maybe change profiles class to include more than one bit
                         profiles = dataset.profiles[raftname][SNN][f'amp{hdu:02d}']
+
                         try:
                             profile_x = profiles[f'{bits[0]}s_bit'].xarr 
+
                         except KeyError:
                             print((f'No profile data for {run} {raftname} {SNN} amp{hdu:02d}'))
                             continue
@@ -283,23 +285,25 @@ class adcTask():
                         for i in range(len(bar_lims) // 2):
                             p_ax.axvspan(bar_lims[2 * i], bar_lims[2 * i + 1], color = bar_color, alpha = bar_alpha)
 
-        for prof_bit in bits:
-            title += f'{prof_bit}s '
-            fname += f'{prof_bit}s_'
+                for prof_bit in bits:
+                    title += f'{prof_bit}s '
+                    fname += f'{prof_bit}s_'
 
-        title += 'Bits Profiles'
-        fname += 'bits_profiles.png'
+                title += 'Bits Profiles'
+                fname += 'bits_profiles.png'
 
-        profs.suptitle(title, fontsize = 16)
-        profs.text(0.5, 0.0, 'Signal (adu)', ha = 'center')
-        profs.text(0.0, 0.5, 'Bit Frequency in Bin', va = 'center', rotation = 'vertical')
-        handles, labels = p_ax.get_legend_handles_labels()
-        profs.legend(handles, labels, 'upper right', fontsize='xx-large')
-        profs.tight_layout()
-        profs.subplots_adjust(top = 0.96)
+                profs.suptitle(title, fontsize = 16)
+                profs.text(0.5, 0.0, 'Signal (adu)', ha = 'center')
+                profs.text(0.0, 0.5, 'Bit Frequency in Bin', va = 'center', rotation = 'vertical')
+                handles, labels = p_ax.get_legend_handles_labels()
+                profs.legend(handles, labels, 'upper right', fontsize='xx-large')
+                profs.tight_layout()
+                profs.subplots_adjust(top = 0.96)
 
-        plt.savefig(os.path.join(self.saveto, 'plots', fname))
-        plt.close()
+                pathname = os.path.join(self.saveto, 'plots', f'{raftname}')
+                Path(pathname).mkdir(parents=True, exist_ok=True)
+                plt.savefig(os.path.join(pathname, fname))
+                plt.close()
  
 def main(runs, powers, shade, bin_power, imtype, saveto):
     task = adcTask(runs, powers, shade, bin_power, imtype, saveto)
